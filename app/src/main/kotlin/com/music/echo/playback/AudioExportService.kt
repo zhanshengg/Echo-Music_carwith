@@ -9,7 +9,6 @@ import android.os.IBinder
 import androidx.core.content.getSystemService
 import androidx.core.net.toUri
 import androidx.documentfile.provider.DocumentFile
-import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.ContentMetadata
@@ -33,7 +32,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import timber.log.Timber
 import java.io.File
-import java.io.IOException
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -146,18 +144,9 @@ class AudioExportService : Service() {
             }
 
             // Create a CacheDataSource with a dummy upstream (content is fully cached)
-            val dummyUpstreamFactory = DataSource.Factory {
-                object : DataSource {
-                    override fun open(dataSpec: DataSpec) = throw IOException("No upstream available")
-                    override fun read(buffer: ByteArray, offset: Int, length: Int) = throw IOException("No upstream available")
-                    override fun getUri(): Uri? = null
-                    override fun close() {}
-                }
-            }
-
             val cacheDataSourceFactory = CacheDataSource.Factory()
                 .setCache(cache)
-                .setUpstreamDataSourceFactory(dummyUpstreamFactory)
+                .setUpstreamDataSourceFactory(null)
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 
             val cacheDataSource = cacheDataSourceFactory.createDataSource()
