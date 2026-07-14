@@ -184,3 +184,8 @@
 -keepclasseswithmembers class iad1tya.echo.music.listentogether.** {
     kotlinx.serialization.KSerializer serializer(...);
 }
+
+## CarLife SDK
+-keep class com.baidu.carlife.platform.** { *; }
+-keepclassmembers class com.baidu.carlife.platform.** { *; }
+-dontwarn com.baidu.carlife.platform.**
