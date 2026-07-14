@@ -7,10 +7,17 @@ import android.net.ConnectivityManager
 import android.net.Uri
 import android.os.IBinder
 import androidx.core.content.getSystemService
+import androidx.core.net.toUri
 import androidx.documentfile.provider.DocumentFile
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.ContentMetadata
+import androidx.media3.exoplayer.offline.Download
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
 import com.music.innertube.YouTube
+import dagger.hilt.android.AndroidEntryPoint
 import iad1tya.echo.music.constants.AudioQuality
 import iad1tya.echo.music.constants.ExportingSongIdsKey
 import iad1tya.echo.music.constants.ExportedSongIdsKey
@@ -26,10 +33,16 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import timber.log.Timber
 import java.io.File
+import java.io.IOException
+import javax.inject.Inject
 
+@AndroidEntryPoint
 class AudioExportService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val httpClient = OkHttpClient()
+
+    @Inject
+    lateinit var downloadUtil: DownloadUtil
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val songId = intent?.getStringExtra(EXTRA_SONG_ID) ?: return START_NOT_STICKY
@@ -38,6 +51,7 @@ class AudioExportService : Service() {
         val songAlbum = intent.getStringExtra(EXTRA_SONG_ALBUM).orEmpty()
         val artworkUrl = intent.getStringExtra(EXTRA_ARTWORK_URL).orEmpty()
         val targetDirectoryUri = intent.getStringExtra(EXTRA_TARGET_DIRECTORY_URI) ?: return START_NOT_STICKY
+        val subfolder = intent.getStringExtra(EXTRA_SUBFOLDER).orEmpty()
 
         serviceScope.launch {
             exportSong(
@@ -47,6 +61,7 @@ class AudioExportService : Service() {
                 songAlbum = songAlbum,
                 artworkUrl = artworkUrl,
                 targetDirectoryUri = targetDirectoryUri,
+                subfolder = subfolder,
             )
         }
         return START_NOT_STICKY
@@ -59,6 +74,7 @@ class AudioExportService : Service() {
         songAlbum: String,
         artworkUrl: String,
         targetDirectoryUri: String,
+        subfolder: String = "",
     ) {
         val safeTitle = sanitizeTitle(songTitle.ifBlank { songId })
         addExportingSongId(songId)
@@ -68,16 +84,24 @@ class AudioExportService : Service() {
         val tempMp3File = File.createTempFile("export_result_", ".mp3", cacheDir)
 
         try {
-            val connectivityManager = getSystemService<ConnectivityManager>()
-                ?: error("No connectivity manager")
-            val playbackData = YTPlayerUtils.playerResponseForPlayback(
-                videoId = songId,
-                audioQuality = AudioQuality.OPUS,
-                connectivityManager = connectivityManager,
-            ).getOrThrow()
+            // Try to copy from download cache first
+            val copiedFromCache = copyFromDownloadCache(songId, tempSourceFile)
+            if (copiedFromCache) {
+                Timber.d("Export: copied song $songId from download cache")
+            } else {
+                // Fall back to downloading from network
+                Timber.d("Export: song $songId not in cache, downloading from network")
+                val connectivityManager = getSystemService<ConnectivityManager>()
+                    ?: error("No connectivity manager")
+                val playbackData = YTPlayerUtils.playerResponseForPlayback(
+                    videoId = songId,
+                    audioQuality = AudioQuality.OPUS,
+                    connectivityManager = connectivityManager,
+                ).getOrThrow()
+                downloadStream(playbackData, tempSourceFile)
+            }
 
             val year = fetchSongYear(songId)
-            downloadStream(playbackData, tempSourceFile)
             val artworkDownloaded = downloadArtwork(artworkUrl, tempArtworkFile)
             convertToMp3(
                 sourceFile = tempSourceFile,
@@ -88,12 +112,11 @@ class AudioExportService : Service() {
                 year = year,
                 artworkFile = if (artworkDownloaded) tempArtworkFile else null,
             )
-            writeOutputFile(safeTitle, targetDirectoryUri, tempMp3File)
+            writeOutputFile(safeTitle, targetDirectoryUri, tempMp3File, subfolder)
             addExportedSongId(songId)
         } catch (e: Exception) {
             Timber.e(e, "Export failed for songId=$songId")
         } finally {
-
             tempSourceFile.delete()
             tempArtworkFile.delete()
             tempMp3File.delete()
@@ -101,6 +124,68 @@ class AudioExportService : Service() {
             stopSelf()
         }
     }
+
+    /**
+     * Attempts to copy the downloaded audio from the SimpleCache to the destination file.
+     * Returns true if successful, false if the song is not fully downloaded.
+     */
+    private fun copyFromDownloadCache(songId: String, destFile: File): Boolean {
+        return try {
+            val cache = downloadUtil.downloadCache
+            val downloads = downloadUtil.downloads.value
+            val downloadState = downloads[songId]?.state
+
+            // Check if the download is completed
+            if (downloadState != Download.STATE_COMPLETED) {
+                return false
+            }
+
+            val contentLength = ContentMetadata.getContentLength(cache.getContentMetadata(songId))
+            if (contentLength <= 0 || !cache.isCached(songId, 0, contentLength)) {
+                return false
+            }
+
+            // Create a CacheDataSource with a dummy upstream (content is fully cached)
+            val dummyUpstreamFactory = DataSource.Factory {
+                object : DataSource {
+                    override fun open(dataSpec: DataSpec) = throw IOException("No upstream available")
+                    override fun read(buffer: ByteArray, offset: Int, length: Int) = throw IOException("No upstream available")
+                    override fun getUri(): Uri? = null
+                    override fun close() {}
+                }
+            }
+
+            val cacheDataSourceFactory = CacheDataSource.Factory()
+                .setCache(cache)
+                .setUpstreamDataSourceFactory(dummyUpstreamFactory)
+                .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+
+            val cacheDataSource = cacheDataSourceFactory.createDataSource()
+            val dataSpec = DataSpec.Builder()
+                .setUri(songId.toUri())
+                .setKey(songId)
+                .setPosition(0)
+                .setLength(contentLength)
+                .build()
+
+            cacheDataSource.open(dataSpec)
+            destFile.outputStream().use { output ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                var read: Int
+                while (cacheDataSource.read(buffer, 0, buffer.size).also { read = it } != -1) {
+                    output.write(buffer, 0, read)
+                }
+                output.flush()
+            }
+            cacheDataSource.close()
+
+            destFile.exists() && destFile.length() > 0
+        } catch (e: Exception) {
+            Timber.w(e, "Failed to copy from cache for songId=$songId, falling back to network")
+            false
+        }
+    }
+
     private suspend fun fetchSongYear(songId: String): Int? =
         YouTube.getMediaInfo(songId)
             .getOrNull()
@@ -185,15 +270,29 @@ class AudioExportService : Service() {
         safeTitle: String,
         targetDirectoryUri: String,
         sourceFile: File,
+        subfolder: String = "",
     ) {
         val uri = Uri.parse(targetDirectoryUri)
         if (uri.scheme == "file") {
-            val folder = File(uri.path ?: error("Invalid export directory"))
-            if (!folder.exists() && !folder.mkdirs()) error("Unable to create export directory")
-            sourceFile.copyTo(File(folder, "$safeTitle.mp3"), overwrite = true)
+            val baseFolder = File(uri.path ?: error("Invalid export directory"))
+            val targetFolder = if (subfolder.isNotBlank()) {
+                File(baseFolder, sanitizeTitle(subfolder))
+            } else {
+                baseFolder
+            }
+            if (!targetFolder.exists() && !targetFolder.mkdirs()) error("Unable to create export directory: $targetFolder")
+            sourceFile.copyTo(File(targetFolder, "$safeTitle.mp3"), overwrite = true)
         } else {
-            val destinationDir = DocumentFile.fromTreeUri(this, uri)
+            var destinationDir = DocumentFile.fromTreeUri(this, uri)
                 ?: error("Export directory unavailable")
+
+            // Create subfolder if specified
+            if (subfolder.isNotBlank()) {
+                val safeSubfolder = sanitizeTitle(subfolder)
+                destinationDir = destinationDir.findFile(safeSubfolder) ?: destinationDir.createDirectory(safeSubfolder)
+                    ?: error("Unable to create subfolder: $safeSubfolder")
+            }
+
             val outputFile = destinationDir.createFile("audio/mpeg", "$safeTitle.mp3")
                 ?: error("Unable to create output file")
             sourceFile.inputStream().use { input ->
@@ -248,6 +347,7 @@ class AudioExportService : Service() {
         private const val EXTRA_SONG_ALBUM = "extra_song_album"
         private const val EXTRA_ARTWORK_URL = "extra_artwork_url"
         private const val EXTRA_TARGET_DIRECTORY_URI = "extra_target_directory_uri"
+        private const val EXTRA_SUBFOLDER = "extra_subfolder"
 
         fun start(
             context: Context,
@@ -257,6 +357,7 @@ class AudioExportService : Service() {
             songAlbum: String,
             artworkUrl: String,
             targetDirectoryUri: String,
+            subfolder: String = "",
         ) {
             val intent = Intent(context, AudioExportService::class.java).apply {
                 putExtra(EXTRA_SONG_ID, songId)
@@ -265,6 +366,9 @@ class AudioExportService : Service() {
                 putExtra(EXTRA_SONG_ALBUM, songAlbum)
                 putExtra(EXTRA_ARTWORK_URL, artworkUrl)
                 putExtra(EXTRA_TARGET_DIRECTORY_URI, targetDirectoryUri)
+                if (subfolder.isNotBlank()) {
+                    putExtra(EXTRA_SUBFOLDER, subfolder)
+                }
             }
             context.startService(intent)
         }

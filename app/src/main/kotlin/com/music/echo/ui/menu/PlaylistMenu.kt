@@ -56,11 +56,14 @@ import iad1tya.echo.music.LocalDownloadUtil
 import iad1tya.echo.music.LocalListenTogetherManager
 import iad1tya.echo.music.LocalPlayerConnection
 import iad1tya.echo.music.R
+import iad1tya.echo.music.constants.EnableExportAsMp3Key
+import iad1tya.echo.music.constants.ExportDirectoryUriKey
 import iad1tya.echo.music.db.entities.Playlist
 import iad1tya.echo.music.db.entities.SpeedDialItem
 import iad1tya.echo.music.db.entities.PlaylistSong
 import iad1tya.echo.music.db.entities.Song
 import iad1tya.echo.music.extensions.toMediaItem
+import iad1tya.echo.music.playback.AudioExportService
 import iad1tya.echo.music.playback.ExoDownloadService
 import iad1tya.echo.music.playback.queues.ListQueue
 import iad1tya.echo.music.playback.queues.YouTubeQueue
@@ -71,6 +74,7 @@ import iad1tya.echo.music.ui.component.NewAction
 import iad1tya.echo.music.ui.component.NewActionGrid
 import iad1tya.echo.music.ui.component.PlaylistListItem
 import iad1tya.echo.music.ui.component.TextFieldDialog
+import iad1tya.echo.music.utils.rememberPreference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -101,6 +105,8 @@ fun PlaylistMenu(
     val isSignedIn = remember(innerTubeCookie) {
         "SAPISID" in parseCookieString(innerTubeCookie)
     }
+    val (enableExportAsMp3) = rememberPreference(key = EnableExportAsMp3Key, defaultValue = false)
+    val (exportDirectoryUri) = rememberPreference(key = ExportDirectoryUriKey, defaultValue = "")
     var isSyncing by remember { mutableStateOf(false) }
     var syncedCount by remember { mutableIntStateOf(0) }
     var isSyncComplete by remember { mutableStateOf(false) }
@@ -594,6 +600,39 @@ fun PlaylistMenu(
                                     )
                                 }
                             }
+                        )
+                    }
+                    if (enableExportAsMp3 && songs.isNotEmpty()) {
+                        add(
+                            Material3MenuItemData(
+                                title = { Text(text = stringResource(R.string.action_export)) },
+                                description = { Text(text = "${songs.size} ${stringResource(R.string.songs)}") },
+                                icon = {
+                                    Icon(
+                                        painter = painterResource(R.drawable.file_export),
+                                        contentDescription = null,
+                                    )
+                                },
+                                onClick = {
+                                    if (exportDirectoryUri.isBlank()) {
+                                        Toast.makeText(context, context.getString(R.string.export_directory_not_set), Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        onDismiss()
+                                        songs.forEach { song ->
+                                            AudioExportService.start(
+                                                context = context,
+                                                songId = song.id,
+                                                songTitle = song.song.title,
+                                                songArtist = song.artists.joinToString(", ") { it.name },
+                                                songAlbum = song.song.albumName ?: "",
+                                                artworkUrl = song.thumbnailUrl ?: "",
+                                                targetDirectoryUri = exportDirectoryUri,
+                                                subfolder = playlist.playlist.name,
+                                            )
+                                        }
+                                    }
+                                }
+                            )
                         )
                     }
                     if (autoPlaylist != true && !isGuest) {
