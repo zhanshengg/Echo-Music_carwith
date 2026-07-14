@@ -475,8 +475,6 @@ class MusicService :
     var castConnectionHandler: CastConnectionHandler? = null
         private set
 
-    private var carLifeLyricsManager: CarLifeLyricsManager? = null
-
     private val screenStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
@@ -625,15 +623,6 @@ class MusicService :
                 ).setBitmapLoader(CoilBitmapLoader(this, scope))
                 .build()
         player.repeatMode = dataStore.get(RepeatModeKey, REPEAT_MODE_OFF)
-
-        // Initialize CarLife lyrics manager
-        carLifeLyricsManager = CarLifeLyricsManager(
-            context = this,
-            player = player,
-            database = database,
-            scope = scope,
-        )
-        carLifeLyricsManager?.init()
 
         
         if (dataStore.get(RememberShuffleAndRepeatKey, true)) {
@@ -3197,7 +3186,6 @@ class MusicService :
         
         player.release()
         discordUpdateJob?.cancel()
-        carLifeLyricsManager?.destroy()
         super.onDestroy()
     }
 
