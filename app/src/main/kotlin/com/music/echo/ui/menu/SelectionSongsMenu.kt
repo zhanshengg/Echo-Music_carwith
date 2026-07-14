@@ -46,13 +46,17 @@ import iad1tya.echo.music.LocalDownloadUtil
 import iad1tya.echo.music.LocalPlayerConnection
 import iad1tya.echo.music.LocalSyncUtils
 import iad1tya.echo.music.R
+import iad1tya.echo.music.constants.EnableExportAsMp3Key
+import iad1tya.echo.music.constants.ExportDirectoryUriKey
 import iad1tya.echo.music.db.entities.PlaylistSongMap
 import iad1tya.echo.music.db.entities.Song
 import iad1tya.echo.music.extensions.toMediaItem
 import iad1tya.echo.music.models.MediaMetadata
 import iad1tya.echo.music.models.toMediaMetadata
+import iad1tya.echo.music.playback.AudioExportService
 import iad1tya.echo.music.playback.ExoDownloadService
 import iad1tya.echo.music.playback.queues.ListQueue
+import iad1tya.echo.music.utils.rememberPreference
 import iad1tya.echo.music.ui.component.DefaultDialog
 import iad1tya.echo.music.ui.component.Material3MenuGroup
 import iad1tya.echo.music.ui.component.Material3MenuItemData
@@ -80,6 +84,9 @@ fun SelectionSongMenu(
     val syncUtils = LocalSyncUtils.current
     val listenTogetherManager = iad1tya.echo.music.LocalListenTogetherManager.current
     val isGuest = listenTogetherManager?.isGuestPlaybackRestricted == true
+
+    val (enableExportAsMp3) = rememberPreference(key = EnableExportAsMp3Key, defaultValue = false)
+    val (exportDirectoryUri) = rememberPreference(key = ExportDirectoryUriKey, defaultValue = "")
 
     val allInLibrary by remember {
         mutableStateOf(
@@ -489,6 +496,38 @@ fun SelectionSongMenu(
                             }
                         )
                     )
+                    if (enableExportAsMp3) {
+                        add(
+                            Material3MenuItemData(
+                                title = { Text(text = stringResource(R.string.action_export)) },
+                                description = { Text(text = "${songSelection.size} ${stringResource(R.string.songs)}") },
+                                icon = {
+                                    Icon(
+                                        painter = painterResource(R.drawable.file_export),
+                                        contentDescription = null,
+                                    )
+                                },
+                                onClick = {
+                                    if (exportDirectoryUri.isBlank()) {
+                                        android.widget.Toast.makeText(context, context.getString(R.string.export_directory_not_set), android.widget.Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        onDismiss()
+                                        songSelection.forEach { song ->
+                                            AudioExportService.start(
+                                                context = context,
+                                                songId = song.id,
+                                                songTitle = song.song.title,
+                                                songArtist = song.artists.joinToString(", ") { it.name },
+                                                songAlbum = song.song.albumName ?: "",
+                                                artworkUrl = song.thumbnailUrl ?: "",
+                                                targetDirectoryUri = exportDirectoryUri
+                                            )
+                                        }
+                                    }
+                                }
+                            )
+                        )
+                    }
                     if (songPosition?.isNotEmpty() == true) {
                         add(
                             Material3MenuItemData(
@@ -535,6 +574,9 @@ fun SelectionMediaMetadataMenu(
     val playerConnection = LocalPlayerConnection.current ?: return
     val listenTogetherManager = iad1tya.echo.music.LocalListenTogetherManager.current
     val isGuest = listenTogetherManager?.isGuestPlaybackRestricted == true
+
+    val (enableExportAsMp3) = rememberPreference(key = EnableExportAsMp3Key, defaultValue = false)
+    val (exportDirectoryUri) = rememberPreference(key = ExportDirectoryUriKey, defaultValue = "")
 
     val allLiked by remember(songSelection) {
         mutableStateOf(songSelection.isNotEmpty() && songSelection.all { it.liked })
@@ -864,6 +906,38 @@ fun SelectionMediaMetadataMenu(
                             }
                         }
                     )
+                    if (enableExportAsMp3) {
+                        add(
+                            Material3MenuItemData(
+                                title = { Text(text = stringResource(R.string.action_export)) },
+                                description = { Text(text = "${songSelection.size} ${stringResource(R.string.songs)}") },
+                                icon = {
+                                    Icon(
+                                        painter = painterResource(R.drawable.file_export),
+                                        contentDescription = null,
+                                    )
+                                },
+                                onClick = {
+                                    if (exportDirectoryUri.isBlank()) {
+                                        android.widget.Toast.makeText(context, context.getString(R.string.export_directory_not_set), android.widget.Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        onDismiss()
+                                        songSelection.forEach { song ->
+                                            AudioExportService.start(
+                                                context = context,
+                                                songId = song.id,
+                                                songTitle = song.title,
+                                                songArtist = song.artists.joinToString(", ") { it.name },
+                                                songAlbum = song.album?.title ?: "",
+                                                artworkUrl = song.thumbnailUrl ?: "",
+                                                targetDirectoryUri = exportDirectoryUri
+                                            )
+                                        }
+                                    }
+                                }
+                            )
+                        )
+                    }
                 }
             )
         }
