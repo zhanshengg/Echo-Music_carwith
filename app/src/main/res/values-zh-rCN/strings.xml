@@ -56,6 +56,11 @@
     <string name="remove_from_library">从媒体库中移除</string>
     <string name="action_download">下载</string>
     <string name="downloading">正在下载</string>
+    <string name="action_export">导出</string>
+    <string name="action_exported">已导出</string>
+    <string name="exporting">正在导出</string>
+    <string name="export_desc">导出为 320kbps MP3</string>
+    <string name="export_directory_not_set">未设置导出目录，请在设置中配置。</string>
     <string name="remove_download">移除下载</string>
     <string name="import_playlist">导入播放列表</string>
     <string name="add_to_playlist">加入播放列表</string>
