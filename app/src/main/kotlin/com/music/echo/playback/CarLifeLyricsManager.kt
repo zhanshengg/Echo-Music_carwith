@@ -1,15 +1,9 @@
 package iad1tya.echo.music.playback
 
+import android.app.NotificationManager
 import android.content.Context
-import android.content.Intent
+import androidx.core.app.NotificationCompat
 import androidx.media3.common.Player
-import com.baidu.carlife.platform.CLPlatformCallback
-import com.baidu.carlife.platform.CLPlatformManager
-import com.baidu.carlife.platform.model.CLSongData
-import com.baidu.carlife.platform.request.CLGetSongDataReq
-import com.baidu.carlife.platform.request.CLRequest
-import com.baidu.carlife.platform.response.CLGetSongDataResp
-import com.baidu.carlife.platform.response.CLResponse
 import iad1tya.echo.music.db.MusicDatabase
 import iad1tya.echo.music.db.entities.LyricsEntity
 import iad1tya.echo.music.extensions.currentMetadata
@@ -18,24 +12,26 @@ import iad1tya.echo.music.lyrics.LyricsUtils
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import timber.log.Timber
-import java.nio.charset.StandardCharsets
 
 /**
- * Manages CarLife SDK integration for displaying lyrics on car head units.
+ * Manages lyrics display on car head units (CarWith/CarLife) by updating
+ * the notification bar subText with the current lyric line.
  *
- * CarLife protocol flow:
- * 1. Initialize CLPlatformManager with CLPlatformCallback
- * 2. When car requests lyrics via CLGetSongDataReq, respond with CLGetSongDataResp
- * 3. CLSongData.data contains the current lyric line as UTF-8 bytes
- * 4. Also proactively push lyric updates when the current line changes
+ * CarWith reads lyrics from the Android notification subText field,
+ * NOT from MediaSession extras or CarLife SDK data channels.
+ *
+ * Key principles:
+ * - Parse LRC lyrics from Room database
+ * - Match current playback position to find the active lyric line
+ * - Update notification subText via NotificationManager.notify()
+ * - Do NOT use player.replaceMediaItem() — it reloads the song and breaks cover art loading
  */
 class CarLifeLyricsManager(
     private val context: Context,
     private val player: Player,
     private val database: MusicDatabase,
     private val scope: CoroutineScope,
-) : CLPlatformCallback {
-
+) {
     private var parsedLyrics: List<LyricsEntry>? = null
     private var currentLyricsId: String? = null
     private var lyricsUpdateJob: Job? = null
@@ -43,46 +39,22 @@ class CarLifeLyricsManager(
     private val _currentLyricLine = MutableStateFlow("")
     val currentLyricLine: StateFlow<String> = _currentLyricLine.asStateFlow()
 
-    private var isInitialized = false
-
     private val playerListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
-            scope.launch {
-                onSongChanged()
-            }
+            scope.launch { onSongChanged() }
         }
     }
 
     companion object {
-        private const val TAG = "CarLifeLyrics"
+        private const val TAG = "CarWithLyrics"
         private const val LYRIC_UPDATE_INTERVAL_MS = 200L
-        private const val APP_KEY = "EchoMusic"
+        private const val NOTIFICATION_ID = 888
     }
 
     fun init() {
-        if (isInitialized) return
-
-        try {
-            val manager = CLPlatformManager.getInstance()
-            val carlifeIntent = Intent().apply {
-                setPackage("com.baidu.carlife")
-            }
-
-            val installed = CLPlatformManager.isCarlifeInstalled(context, carlifeIntent)
-            Timber.tag(TAG).d("CarLife installed: $installed")
-
-            val success = manager.init(context, APP_KEY, this, carlifeIntent)
-            Timber.tag(TAG).d("CarLife init success: $success")
-            isInitialized = success
-
-            if (success) {
-                player.addListener(playerListener)
-                // Load lyrics for current song if any
-                scope.launch { onSongChanged() }
-            }
-        } catch (e: Exception) {
-            Timber.tag(TAG).e(e, "Failed to initialize CarLife SDK")
-        }
+        player.addListener(playerListener)
+        scope.launch { onSongChanged() }
+        Timber.tag(TAG).d("CarWithLyricsManager initialized (notification subText mode)")
     }
 
     fun destroy() {
@@ -90,19 +62,9 @@ class CarLifeLyricsManager(
         lyricsUpdateJob = null
         parsedLyrics = null
         currentLyricsId = null
-
         try {
             player.removeListener(playerListener)
         } catch (_: Exception) {}
-
-        if (isInitialized) {
-            try {
-                CLPlatformManager.getInstance().destroy()
-            } catch (e: Exception) {
-                Timber.tag(TAG).e(e, "Failed to destroy CarLife SDK")
-            }
-            isInitialized = false
-        }
     }
 
     private suspend fun onSongChanged() {
@@ -111,6 +73,7 @@ class CarLifeLyricsManager(
         parsedLyrics = null
         currentLyricsId = null
         _currentLyricLine.value = ""
+        clearNotificationSubText()
 
         val metadata = player.currentMetadata
         val songId = metadata?.id ?: return
@@ -124,7 +87,6 @@ class CarLifeLyricsManager(
             parsedLyrics = LyricsUtils.parseLyrics(lyricsEntity.lyrics)
             Timber.tag(TAG).d("Parsed ${parsedLyrics?.size} lyrics lines for $songId")
 
-            // Start tracking current lyric line
             lyricsUpdateJob = scope.launch {
                 trackCurrentLyricLine()
             }
@@ -154,97 +116,53 @@ class CarLifeLyricsManager(
 
         if (lineText != _currentLyricLine.value) {
             _currentLyricLine.value = lineText
-            Timber.tag(TAG).d("Lyric changed: $lineText")
-            // Push lyric update to CarLife
-            pushLyricUpdate(lineText)
+            if (lineText.isNotEmpty()) {
+                Timber.tag(TAG).d("Lyric changed: $lineText")
+            }
+            updateNotificationSubText(lineText)
         }
     }
 
-    private fun pushLyricUpdate(lyricText: String) {
-        if (!isInitialized) return
-
+    /**
+     * Updates the notification bar subText with the current lyric line.
+     * CarWith reads this field to display lyrics on the car head unit.
+     *
+     * We grab the existing notification, rebuild it with subText, and re-notify.
+     * This avoids disrupting the media notification provider's state.
+     */
+    private fun updateNotificationSubText(lyrics: String) {
         try {
-            val songData = CLSongData().apply {
-                songId = currentLyricsId ?: ""
-                tag = CLSongData.TAG_CONTENT
-                data = lyricText.toByteArray(StandardCharsets.UTF_8)
-                len = data?.size ?: 0
-                offset = 0
-                totalSize = len.toLong()
-            }
+            val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE)
+                as? NotificationManager ?: return
 
-            val resp = CLGetSongDataResp().apply {
-                errorNo = CLResponse.ERROR_NONE
-                this.songData = songData
-                requestId = 0
-            }
+            val existingNotification = notificationManager.activeNotifications
+                .find { it.id == NOTIFICATION_ID }?.notification ?: return
 
-            val result = CLPlatformManager.getInstance().sendResp(resp)
-            Timber.tag(TAG).d("Pushed lyric update, result: $result")
+            val builder = NotificationCompat.Builder(context, existingNotification)
+                .setSubText(lyrics.ifEmpty { null })
+                .setOnlyAlertOnce(true)
+
+            notificationManager.notify(NOTIFICATION_ID, builder.build())
         } catch (e: Exception) {
-            Timber.tag(TAG).e(e, "Failed to push lyric update")
+            Timber.tag(TAG).w(e, "Failed to update notification subText with lyrics")
         }
     }
 
-    // region CLPlatformCallback
-
-    override fun onConnected() {
-        Timber.tag(TAG).d("CarLife connected")
-    }
-
-    override fun onCarlifeRequest(request: CLRequest?) {
-        if (request == null) return
-
+    private fun clearNotificationSubText() {
         try {
-            when (request.getRequestType()) {
-                CLRequest.REQUEST_GET_SONG_DATA -> {
-                    val req = request as? CLGetSongDataReq
-                    Timber.tag(TAG).d("Received CLGetSongDataReq for songId: ${req?.songId}")
-                    handleSongDataRequest(req)
-                }
-                else -> {
-                    Timber.tag(TAG).d("Received unsupported request type: ${request.getRequestType()}")
-                }
-            }
+            val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE)
+                as? NotificationManager ?: return
+
+            val existingNotification = notificationManager.activeNotifications
+                .find { it.id == NOTIFICATION_ID }?.notification ?: return
+
+            val builder = NotificationCompat.Builder(context, existingNotification)
+                .setSubText(null)
+                .setOnlyAlertOnce(true)
+
+            notificationManager.notify(NOTIFICATION_ID, builder.build())
         } catch (e: Exception) {
-            Timber.tag(TAG).e(e, "Error handling CarLife request")
+            // Ignore
         }
     }
-
-    private fun handleSongDataRequest(req: CLGetSongDataReq?) {
-        val currentLine = _currentLyricLine.value
-        val songId = currentLyricsId ?: req?.songId ?: ""
-
-        try {
-            val songData = CLSongData().apply {
-                this.songId = songId
-                tag = CLSongData.TAG_CONTENT
-                data = currentLine.toByteArray(StandardCharsets.UTF_8)
-                len = data?.size ?: 0
-                offset = 0
-                totalSize = len.toLong()
-            }
-
-            val resp = CLGetSongDataResp().apply {
-                errorNo = CLResponse.ERROR_NONE
-                this.songData = songData
-                requestId = req?.requestId ?: 0
-            }
-
-            val result = CLPlatformManager.getInstance().sendResp(resp)
-            Timber.tag(TAG).d("Sent CLGetSongDataResp, result: $result, lyric: $currentLine")
-        } catch (e: Exception) {
-            Timber.tag(TAG).e(e, "Failed to send song data response")
-        }
-    }
-
-    override fun onCarlifeResponse(response: CLResponse?) {
-        Timber.tag(TAG).d("Received CarLife response: ${response?.getResponseType()}")
-    }
-
-    override fun onCarlifeError(errorNo: Int, errorMsg: String?) {
-        Timber.tag(TAG).e("CarLife error: $errorNo - $errorMsg")
-    }
-
-    // endregion
 }

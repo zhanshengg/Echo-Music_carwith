@@ -344,7 +344,4 @@ dependencies {
     implementation(libs.androidx.core.splashscreen)
     implementation(libs.ffmpeg.kit.audio)
 
-    // CarLife SDK for car lyrics display
-    implementation(files("libs/carlife-sdk-2.2.0.jar"))
-
 }
